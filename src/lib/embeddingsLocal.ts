@@ -37,9 +37,52 @@ async function getPipeline() {
   return pipelinePromise;
 }
 
+export async function embedTextHF(text: string): Promise<number[]> {
+  if (typeof text !== "string" || text.trim().length === 0) throw new Error("embedTextHF: empty");
+  const trimmed = text.trim().slice(0, 8000);
+  const hfKey = process.env.HF_API_KEY?.trim() || process.env.HF_TOKEN?.trim() || "";
+  const url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2";
+  const headers: Record<string,string> = { "Content-Type": "application/json" };
+  if (hfKey) headers["Authorization"] = `Bearer ${hfKey}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ inputs: trimmed, options: { wait_for_model: true } }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`HF API ${res.status}: ${txt.slice(0,300)}`);
+  }
+  const data = await res.json();
+  // HF returns number[] for single input (384) or number[][] for batch
+  let arr: number[];
+  if (Array.isArray(data) && typeof data[0] === "number") arr = data as number[];
+  else if (Array.isArray(data) && Array.isArray(data[0])) {
+    // Mean pooling already done by pipeline, but if batched, take first
+    arr = (data as number[][])[0];
+  } else {
+    throw new Error(`HF unexpected response: ${JSON.stringify(data).slice(0,300)}`);
+  }
+  // Normalize (HF pipeline with normalize:true already, but ensure)
+  const norm = Math.sqrt(arr.reduce((s,v)=>s+v*v,0)) || 1;
+  const normalized = arr.map(v=>v/norm);
+  if (normalized.length !== LOCAL_EMBEDDING_DIMS) console.warn(`[embedHF] dims ${normalized.length} != ${LOCAL_EMBEDDING_DIMS}`);
+  return normalized;
+}
+
 export async function embedTextLocal(text: string): Promise<number[]> {
   if (typeof text !== "string" || text.trim().length === 0) throw new Error("embedTextLocal: empty");
   const trimmed = text.trim().slice(0, 8000);
+  // On Vercel (serverless), @xenova/transformers fails due to missing libonnxruntime.so — use HF API instead
+  const isVercel = !!process.env.VERCEL || !!process.env.VERCEL_ENV;
+  if (isVercel) {
+    try {
+      return await embedTextHF(trimmed);
+    } catch (e) {
+      console.warn(`[embedLocal] HF fallback failed on Vercel, trying local pipeline as last resort: ${e instanceof Error ? e.message.slice(0,120) : String(e)}`);
+      // fall through to local pipeline
+    }
+  }
   const pipe = await getPipeline();
   // Xenova pipeline returns Tensor with mean pooling + normalize options
   const output = await pipe(trimmed, { pooling: "mean", normalize: true });
