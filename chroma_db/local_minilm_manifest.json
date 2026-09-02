@@ -1,0 +1,8 @@
+{
+  "collection": "sociology-minilm",
+  "embedding_model": "Xenova/all-MiniLM-L6-v2",
+  "dims": 384,
+  "count": 1603,
+  "created_at": "2026-09-02T09:54:39.448Z",
+  "source": "Sociology.pdf"
+}
