@@ -238,11 +238,45 @@ async function queryLocalStore(embedding: number[], topK: number, storePath: str
   }));
 }
 
+function keywordSearch(query: string, topK: number, storePath: string): RagChunk[] {
+  const raw = fs.readFileSync(storePath, "utf-8");
+  const store = JSON.parse(raw) as { chunks: Array<{id:string; text:string; metadata:any}> };
+  const qWords = query.toLowerCase().split(/\W+/).filter(w=>w.length>2);
+  const qSet = new Set(qWords);
+  const scored = store.chunks.map(c => {
+    const textLow = c.text.toLowerCase();
+    let score = 0;
+    for (const w of qSet) {
+      const re = new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}\\b`, 'g');
+      const matches = textLow.match(re);
+      if (matches) score += matches.length * (w.length > 5 ? 2 : 1);
+      // Bonus for theorist names
+      if (["weber","marx","durkheim","comte","parsons","merton","functionalism","bureaucracy","stratification"].includes(w)) score += 5;
+    }
+    // Normalize by length
+    score = score / (1 + Math.log(1 + c.text.length/500));
+    return { chunk: c, score };
+  }).sort((a,b)=>b.score-a.score).slice(0, topK);
+  // Convert score to pseudo-similarity for gating (keyword scores >1 are good)
+  return scored.map(s => ({
+    id: s.chunk.id,
+    text: s.chunk.text,
+    metadata: s.chunk.metadata,
+    distance: 1 - Math.min(1, s.score/5),
+    similarity: Math.min(1, s.score/5),
+  }));
+}
+
 async function embedWithFallback(text: string): Promise<{embedding:number[]; model:string}> {
-  const localFlag = process.env.RAG_MODE === "local_minilm" || process.env.USE_LOCAL_EMBEDDINGS === "1" || hasLocalMiniLM();
-  const forceLocal = process.env.RAG_MODE === "local_minilm";
+  const forceLocal = process.env.RAG_MODE === "local_minilm" || hasLocalMiniLM();
   if (forceLocal) {
-    return { embedding: await embedTextLocal(text), model: "local_minilm" };
+    try {
+      return { embedding: await embedTextLocal(text), model: "local_minilm" };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[rag] local MiniLM embed failed (${msg.slice(0,150)}), will try keyword fallback`);
+      throw new Error(`EMBED_FALLBACK_KEYWORD:${msg}`);
+    }
   }
   // Try OpenAI first, fallback to local on quota/rate or if local store exists and OpenAI not configured
   try {
@@ -253,10 +287,18 @@ async function embedWithFallback(text: string): Promise<{embedding:number[]; mod
     const isQuota = /insufficient_quota|credit_balance_exhausted|429|quota|billing/i.test(msg);
     if (isQuota && hasLocalMiniLM()) {
       console.warn(`[rag] OpenAI embed failed (${msg.slice(0,120)}), falling back to local MiniLM`);
-      return { embedding: await embedTextLocal(text), model: "local_minilm" };
+      try {
+        return { embedding: await embedTextLocal(text), model: "local_minilm" };
+      } catch (e2) {
+        throw new Error(`EMBED_FALLBACK_KEYWORD:${e2 instanceof Error ? e2.message : String(e2)}`);
+      }
     }
     if (hasLocalMiniLM() && !process.env.OPENAI_API_KEY) {
-      return { embedding: await embedTextLocal(text), model: "local_minilm" };
+      try {
+        return { embedding: await embedTextLocal(text), model: "local_minilm" };
+      } catch (e2) {
+        throw new Error(`EMBED_FALLBACK_KEYWORD:${e2 instanceof Error ? e2.message : String(e2)}`);
+      }
     }
     throw err;
   }
@@ -281,18 +323,38 @@ async function generateWithFallback(prompt: string): Promise<{answer:string; usa
 export async function retrieveAndGenerate(question: string): Promise<RetrieveAndGenerateResult> {
   const sanitized = validateInput(question);
 
-  // 1. Embed question (try OpenAI, fallback to local MiniLM if quota or RAG_MODE=local_minilm)
-  const { embedding, model } = await embedWithFallback(sanitized);
+  // 1. Embed question (try OpenAI, fallback to local MiniLM, fallback to keyword on Vercel)
+  let embedding: number[] | null = null;
+  let model = "keyword";
+  let useKeyword = false;
+  try {
+    const res = await embedWithFallback(sanitized);
+    embedding = res.embedding;
+    model = res.model;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.startsWith("EMBED_FALLBACK_KEYWORD") && hasLocalMiniLM()) {
+      console.warn(`[rag] using keyword fallback for "${sanitized.slice(0,60)}"`);
+      useKeyword = true;
+      model = "keyword";
+    } else {
+      throw err;
+    }
+  }
 
-  // 2. Retrieve top-k — choose store matching embedding model
+  // 2. Retrieve top-k — choose store matching embedding model, or keyword
   let rawChunks: RagChunk[];
-  if (model === "local_minilm" && hasLocalMiniLM()) {
+  if (useKeyword && hasLocalMiniLM()) {
+    rawChunks = keywordSearch(sanitized, DEFAULT_TOP_K, LOCAL_MINILM_JSON);
+  } else if (embedding && model === "local_minilm" && hasLocalMiniLM()) {
     rawChunks = await queryLocalStore(embedding, DEFAULT_TOP_K, LOCAL_MINILM_JSON);
-  } else if (hasLocalOpenAI() && !process.env.CHROMA_API_KEY) {
+  } else if (embedding && hasLocalOpenAI() && !process.env.CHROMA_API_KEY) {
     // Demo without Chroma Cloud keys but with local OpenAI store
     rawChunks = await queryLocalStore(embedding, DEFAULT_TOP_K, LOCAL_OPENAI_JSON);
-  } else {
+  } else if (embedding) {
     rawChunks = await queryCollection(embedding, DEFAULT_TOP_K);
+  } else {
+    throw new Error("No embedding and no keyword fallback available");
   }
 
   // 3. Confidence gate — compute similarities from distances (distanceToSimilarity)

@@ -40,34 +40,46 @@ async function getPipeline() {
 export async function embedTextHF(text: string): Promise<number[]> {
   if (typeof text !== "string" || text.trim().length === 0) throw new Error("embedTextHF: empty");
   const trimmed = text.trim().slice(0, 8000);
-  const hfKey = process.env.HF_API_KEY?.trim() || process.env.HF_TOKEN?.trim() || "";
-  const url = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2";
-  const headers: Record<string,string> = { "Content-Type": "application/json" };
-  if (hfKey) headers["Authorization"] = `Bearer ${hfKey}`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ inputs: trimmed, options: { wait_for_model: true } }),
-  });
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`HF API ${res.status}: ${txt.slice(0,300)}`);
+  const hfKey = process.env.HF_API_KEY?.trim() || process.env.HF_TOKEN?.trim() || process.env.HUGGINGFACE_API_KEY?.trim() || "";
+  // Try new HF Inference Router, then legacy pipeline endpoint
+  const urls = [
+    "https://router.huggingface.co/hf-inference/models/sentence-transformers/all-MiniLM-L6-v2",
+    "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2",
+    "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
+  ];
+  let lastErr: string | null = null;
+  for (const url of urls) {
+    try {
+      const headers: Record<string,string> = { "Content-Type": "application/json" };
+      if (hfKey) headers["Authorization"] = `Bearer ${hfKey}`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ inputs: trimmed, options: { wait_for_model: true } }),
+      });
+      if (!res.ok) {
+        const txt = await res.text();
+        lastErr = `HF ${res.status} at ${url}: ${txt.slice(0,200)}`;
+        if (res.status === 404 || res.status === 401) continue;
+        throw new Error(lastErr);
+      }
+      const data = await res.json();
+      let arr: number[];
+      if (Array.isArray(data) && typeof data[0] === "number") arr = data as number[];
+      else if (Array.isArray(data) && Array.isArray(data[0])) arr = (data as number[][])[0];
+      else throw new Error(`HF unexpected response at ${url}: ${JSON.stringify(data).slice(0,200)}`);
+      const norm = Math.sqrt(arr.reduce((s,v)=>s+v*v,0)) || 1;
+      const normalized = arr.map(v=>v/norm);
+      if (normalized.length !== LOCAL_EMBEDDING_DIMS) console.warn(`[embedHF] dims ${normalized.length} != ${LOCAL_EMBEDDING_DIMS} from ${url}`);
+      return normalized;
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      // If fetch failed (network), try next URL
+      if (lastErr.includes("fetch failed") || lastErr.includes("404") || lastErr.includes("401")) continue;
+      throw e;
+    }
   }
-  const data = await res.json();
-  // HF returns number[] for single input (384) or number[][] for batch
-  let arr: number[];
-  if (Array.isArray(data) && typeof data[0] === "number") arr = data as number[];
-  else if (Array.isArray(data) && Array.isArray(data[0])) {
-    // Mean pooling already done by pipeline, but if batched, take first
-    arr = (data as number[][])[0];
-  } else {
-    throw new Error(`HF unexpected response: ${JSON.stringify(data).slice(0,300)}`);
-  }
-  // Normalize (HF pipeline with normalize:true already, but ensure)
-  const norm = Math.sqrt(arr.reduce((s,v)=>s+v*v,0)) || 1;
-  const normalized = arr.map(v=>v/norm);
-  if (normalized.length !== LOCAL_EMBEDDING_DIMS) console.warn(`[embedHF] dims ${normalized.length} != ${LOCAL_EMBEDDING_DIMS}`);
-  return normalized;
+  throw new Error(`HF all endpoints failed: ${lastErr}`);
 }
 
 export async function embedTextLocal(text: string): Promise<number[]> {
