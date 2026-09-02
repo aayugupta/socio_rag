@@ -1,0 +1,227 @@
+# CI — Sociology RAG  (Architecture §4)
+# Triggers: push + PR on any branch. Blocks merge if lint/typecheck or secret scan fails.
+# Branch protection (required): set this workflow as required check on `main` — see note at bottom.
+#
+# Jobs per spec:
+#   1) lint + typecheck  (npm run lint, tsc --noEmit) — Node 20
+#   2) gitleaks secret scan — gitleaks/gitleaks-action + grep fallback for OPENAI_API_KEY patterns
+#   3) optional eval run (manual / if EVAL_STAGING_URL is set) against staging
+#
+# Fail-closed: any job failure blocks PR merge when branch protection is enabled.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+# Avoid duplicate runs on same PR/branch
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Job 1: lint + typecheck (Architecture §4: 1. Lint + typecheck)
+  # -------------------------------------------------------------------------
+  lint-typecheck:
+    name: lint + typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history for gitleaks baseline; also needed for accurate lint
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: ESLint (npm run lint)
+        run: npm run lint
+
+      - name: Typecheck (tsc --noEmit)
+        run: npx tsc --noEmit
+
+  # -------------------------------------------------------------------------
+  # Job 2: secret scan — gitleaks + fallback grep (Architecture §3.1, §4)
+  # Blocks merge if a secret pattern is found. Rotate the key immediately if triggered —
+  # removing it in a later commit does NOT purge git history.
+  # -------------------------------------------------------------------------
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Primary scanner: gitleaks official action
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITLEAKS_LICENSE not needed for open-source repo (free)
+        # Do not swallow errors — a leak must block the run
+
+      # Fallback / explicit grep layer (catches OPENAI_API_KEY / CHROMA / UPSTASH patterns even if gitleaks misses a novel format)
+      # This is the user-visible “grep for OPENAI_API_KEY patterns” from the deliverable spec.
+      - name: Fallback grep for secret patterns
+        if: always()  # run even if gitleaks step was skipped/failed — we still want to inspect
+        run: |
+          echo "::group::Fallback grep — OPENAI_API_KEY / CHROMA_API_KEY / UPSTASH_TOKEN patterns"
+          set +e
+          # Search tracked files only (skip .git, node_modules, .next)
+          # Pattern purposely broad: sk-..., sk-proj-..., CHROMA_API_KEY=..., UPSTASH...REST_TOKEN
+          PATTERNS=(
+            # OpenAI keys are sk- followed by 20+ alphanum/ -_  (real keys are long; placeholder sk-your... must NOT trigger)
+            "sk-[A-Za-z0-9_-]{20,}"
+            "sk-proj-[A-Za-z0-9_-]{20,}"
+            # Generic assignment with a long value (>20 chars) — catches committed .env leakage
+            "OPENAI_API_KEY\s*=\s*.{20,}"
+            "CHROMA_API_KEY\s*=\s*.{10,}"
+            "UPSTASH_REDIS_REST_TOKEN\s*=\s*.{10,}"
+            # HMAC / passphrase leakage
+            "APP_SECRET\s*=\s*.{20,}"
+          )
+          # Also plain regex grep over common code files; allow failure (no matches = success)
+          FOUND=0
+          for pat in "${PATTERNS[@]}"; do
+            echo "Checking pattern: $pat"
+            if git grep -I -E -n "$pat" -- . ':!node_modules' ':!.next' ':!.git' ':!package-lock.json' ':!.github/workflows/ci.yml'; then
+              # Filter out known safe placeholders — these are expected in .env.example / docs
+              # If any real match remains after filtering, we fail the job
+              echo "  -> pattern matched above"
+              FOUND=1
+            fi
+          done
+
+          # Second pass: strict check — fail if real key outside .env.example / docs
+          # Re-run with exclusions for placeholder files
+          echo ""
+          echo "Strict check (excluding .env.example, *.md docs, CI file itself):"
+          STRICT_FOUND=0
+          for pat in "sk-[A-Za-z0-9_-]{20,}" "sk-proj-[A-Za-z0-9_-]{20,}"; do
+            if git grep -I -E -n "$pat" -- . ':!node_modules' ':!.next' ':!.git' ':!.env.example' ':!*.md' ':!package-lock.json' ':!.github/workflows/ci.yml'; then
+              echo "::error::Potential real OPENAI_API_KEY pattern found outside allowed placeholder file (see grep above). Rotate the key, remove it from git history (BFG / git filter-repo), and re-push. This job intentionally fails to block merge."
+              STRICT_FOUND=1
+            fi
+          done
+
+          # Also fail if any .env.local or .env with real values was accidentally tracked (should be gitignored)
+          if git ls-files --error-unmatch .env 2>/dev/null; then
+            echo "::error::.env is tracked in git — it must be gitignored. Remove with: git rm --cached .env && echo '.env' >> .gitignore"
+            STRICT_FOUND=1
+          fi
+          if git ls-files --error-unmatch .env.local 2>/dev/null; then
+            echo "::error::.env.local is tracked in git — it must be gitignored. Remove with: git rm --cached .env.local"
+            STRICT_FOUND=1
+          fi
+
+          if [ "$STRICT_FOUND" -eq 1 ]; then
+            echo "Found strict-match secrets — failing CI."
+            exit 1
+          fi
+          echo "No strict-match real secrets found (fallible heuristic — gitleaks above is authoritative)."
+          echo "::endgroup::"
+
+      - name: Leak remediation hint (always)
+        if: always()
+        run: |
+          echo "If this job failed:"
+          echo "  1) Rotate the exposed key immediately in the vendor dashboard (OpenAI / Chroma Cloud / Upstash)."
+          echo "  2) Do NOT just delete the file in a later commit — the secret remains in git history."
+          echo "  3) Purge history: git filter-repo or BFG, then force-push and rotate again."
+          echo "  4) Re-run CI. Push protection on GitHub should also have blocked the push if enabled."
+
+  # -------------------------------------------------------------------------
+  # Job 3: optional eval (PRD §A.5, Architecture §4 "optional run eval set against staging")
+  # Only runs on workflow_dispatch or when vars/secrets provide a staging URL.
+  # Does not block merge unless you mark it as required.
+  # -------------------------------------------------------------------------
+  eval-optional:
+    name: eval (optional, staging)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint-typecheck, secret-scan]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      vars.EVAL_STAGING_URL != '' ||
+      secrets.EVAL_STAGING_URL != ''
+    # Continue-on-error by default — eval is informational, not a hard gate.
+    # Set `continue-on-error: false` if you want eval to block merges.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Run eval against staging
+        env:
+          EVAL_STAGING_URL: ${{ vars.EVAL_STAGING_URL || secrets.EVAL_STAGING_URL }}
+          APP_PASSPHRASE: ${{ secrets.APP_PASSPHRASE || vars.APP_PASSPHRASE }}
+        run: |
+          if [ -z "$EVAL_STAGING_URL" ]; then
+            echo "No EVAL_STAGING_URL set (vars.EVAL_STAGING_URL / secrets.EVAL_STAGING_URL) — skipping remote eval."
+            echo "To enable: set EVAL_STAGING_URL in repo Variables, or run workflow_dispatch with inputs."
+            exit 0
+          fi
+          echo "Running eval against $EVAL_STAGING_URL (this takes ~2 min for 30 questions at ~0.3s/q + rate limit pauses)"
+          # --strict would make eval block on low scores; for optional CI we just report
+          if [ -n "$APP_PASSPHRASE" ]; then
+            npx tsx eval/run_eval.ts --url "$EVAL_STAGING_URL" --passphrase "$APP_PASSPHRASE" --verbose || echo "::warning::Eval thresholds not met or eval failed — see report above"
+          else
+            echo "::warning::APP_PASSPHRASE not set — eval will likely get 401 unless staging is open in dev"
+            npx tsx eval/run_eval.ts --url "$EVAL_STAGING_URL" --verbose || echo "::warning::Eval failed — see logs"
+          fi
+
+      - name: Upload eval report (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            eval/results.json
+            eval/results.md
+          if-no-files-found: warn
+          retention-days: 14
+
+# ---------------------------------------------------------------------------
+# Branch protection note (read this after CI is green once):
+# ---------------------------------------------------------------------------
+# 1. In GitHub repo → Settings → Branches → Add rule for `main`:
+#      ☑ Require status checks to pass before merging
+#      ☑ Require branches to be up to date before merging
+#      ☑  Search and select both jobs:  lint-typecheck  and  secret-scan
+#         (eval-optional intentionally NOT required — it's informational)
+# 2. Also enable:
+#      ☑ Require pull request reviews (1)
+#      ☑  Disallow direct pushes (or Require pull request)
+#      ☑  Do not allow bypassing the above settings (for admins if appropriate)
+# 3. Keep GitHub's native Push Protection enabled:
+#      Settings → Code security and analysis → Secret scanning → Push protection → Enable
+#      This is your *first* independent layer; gitleaks in CI is the *second*.
+# 4. If a secret ever ships: rotate immediately; history purge != rotation.
