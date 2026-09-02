@@ -1,3 +1,4 @@
+pass-key -   pHltKTo0e6j1-UQc
 # Sociology RAG Chatbot — Nishant Sir / Level Up IAS (2024)
 
 [![CI](https://github.com/USERNAME/rag-sociology/actions/workflows/ci.yml/badge.svg)](https://github.com/USERNAME/rag-sociology/actions/workflows/ci.yml) [![typecheck](https://github.com/USERNAME/rag-sociology/actions/workflows/ci.yml/badge.svg?label=typecheck)](https://github.com/USERNAME/rag-sociology/actions/workflows/ci.yml) [![secret-scan](https://github.com/USERNAME/rag-sociology/actions/workflows/ci.yml/badge.svg?label=secret%20scan)](https://github.com/USERNAME/rag-sociology/actions/workflows/ci.yml)
